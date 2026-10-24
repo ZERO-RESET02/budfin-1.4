@@ -8,7 +8,7 @@ const err=(m,s=400)=>json({error:m},s);
 const sha=s=>createHash('sha256').update(s).digest('hex'),sign=p=>createHmac('sha256',SECRET).update(p).digest('base64url'),uidOf=e=>sha('u:'+e).slice(0,16);
 const mint=email=>{const p=Buffer.from(JSON.stringify({e:email,x:Date.now()+30*864e5})).toString('base64url');return p+'.'+sign(p)};
 function who(req){const m=/(?:^|;\s*)bf=([^;]+)/.exec(req.headers.get('cookie')||'');if(!m||!SECRET)return null;const [p,s]=m[1].split('.');if(!p||!s)return null;const a=Buffer.from(sign(p)),b=Buffer.from(s);if(a.length!=b.length||!timingSafeEqual(a,b))return null;let o;try{o=JSON.parse(Buffer.from(p,'base64url'))}catch{return null}if(o.x<Date.now())return null;return{email:o.e,id:uidOf(o.e),admin:ADM.includes(o.e)}}
-const COLS=['profiles','groups','members','ideas','ideaIn','ideaReq','replies','lf','meetups','reports','config'],BYF=['groups','ideas','replies','lf','meetups','reports'],UF=['members','ideaIn'];
+const COLS=['profiles','groups','members','ideas','ideaIn','ideaReq','replies','lf','meetups','reports','config','friends'],BYF=['groups','ideas','replies','lf','meetups','reports'],UF=['members','ideaIn'];
 const ASK=['resume','skills','avail','exp','why'],FRESH=15*6e4,PRES=15e4;
 const key=(c,id,g)=>c=='msgs'?`msgs/${g}/${id}`:`${c}/${id}`;
 async function rows(pre){const s=st(),{blobs}=await s.list({prefix:pre});const r=await Promise.all(blobs.slice(0,600).map(async b=>{const d=await s.get(b.key,{type:'json'});return d&&{id:b.key.split('/').pop(),...d}}));return r.filter(Boolean)}
@@ -23,15 +23,19 @@ async function profilesFor(me){const s=st(),raw=await rows('profiles/'),now=Date
   if(p.lat!=null||p.lng!=null){if(typeof p.lat=='number'&&typeof p.lng=='number'&&!p.loc)p.loc=enc({a:Math.round(p.lat*1e5)/1e5,o:Math.round(p.lng*1e5)/1e5});delete p.lat;delete p.lng;ch=1}
   if(p.loc&&now-(p.seen||0)>H3){delete p.loc;p.ready=0;ch=1}
   if(ch){const{id,...doc}=p;await s.setJSON('profiles/'+id,doc)}}
- const mp=raw.find(p=>p.id==me.id),mine=mp&&mp.loc?dec(mp.loc):null,myR=clampR(mp&&mp.rad);
+ const mp=raw.find(p=>p.id==me.id),mine=mp&&mp.loc?dec(mp.loc):null,myR=clampR(mp&&mp.rad),hideFrom=new Set((await rows('friends/')).filter(r=>r.st=='rejected'&&r.hd&&r.f==me.id).map(r=>r.t));
  return raw.map(p=>{const{loc,pg,...o}=p;
   o.online=p.on!==0&&now-(pg||0)<PRES?1:0;
   if(p.id==me.id){o.hasLoc=loc?1:0;return o}
   delete o.blk;delete o.hid;delete o.acc;delete o.seen;delete o.on;delete o.grad;delete o.nm;delete o.ob;
   if(mine&&p.ready&&p.on!==0&&loc&&now-(p.seen||0)<FRESH){const q=dec(loc);if(q){const d=meters(mine,q);if(d<=Math.min(myR,clampR(p.rad)))o.d=Math.round(d)}}
+  if(hideFrom.has(p.id))delete o.d;
   return o})}
 async function groupsFor(me,col='groups'){const raw=await rows(col+'/'),mp=await st().get('profiles/'+me.id,{type:'json'}),mine=mp&&mp.loc&&Date.now()-(mp.seen||0)<=H3?dec(mp.loc):null;
  return raw.map(g=>{const{loc,kk,...o}=g;if(kk&&kk.includes(me.id))o.kd=1;if(mine&&loc){const q=dec(loc);if(q)o.d=Math.round(meters(mine,q))}return o})}
+async function frFor(me){const all=await rows('friends/');return me.admin?all:all.filter(r=>r.f==me.id||r.t==me.id)}
+const nname=n=>{const t=String(n||'').toLowerCase().normalize('NFKC'),k=t.replace(/[^\p{L}\p{N}]+/gu,'');return k||t.trim()};
+async function uniqTeam(t,gid){const base=String(t||'Team').trim().slice(0,70)||'Team',taken=new Set((await rows('groups/')).filter(g=>g.id!=gid).map(g=>nname(g.n)));if(!taken.has(nname(base)))return base;let i=1,n;do{n=base+' · Team'+(i>1?' '+i:'');i++}while(taken.has(nname(n)));return n}
 async function reqFor(me){const all=await rows('ideaReq/');if(me.admin)return all;const mine=new Set((await rows('ideas/')).filter(i=>i.by==me.id).map(i=>i.id));return all.filter(r=>r.u==me.id||mine.has(r.i))}
 async function inboxFor(me){const s=st(),{blobs}=await s.list({prefix:'chatmeta/'}),mem=new Set((await s.list({prefix:'members/'})).blobs.filter(b=>b.key.endsWith('_'+me.id)).map(b=>b.key.slice(8,-me.id.length-1)));
  const keys=blobs.map(b=>b.key).filter(k=>{const g=k.slice(9);return g.startsWith('dm_')?g.slice(3).split('_').includes(me.id):g.startsWith('g_')&&mem.has(g.slice(2))});
@@ -55,11 +59,18 @@ async function write(me,b){const{op,col}=b;if(![...COLS,'msgs'].includes(col))re
  if(col=='ideas'){if(data.kind!=='plan'){delete data.kind;delete data.ask;delete data.cq}else{data.need=Math.min(200,Math.max(2,Math.round(+data.need)||2));data.ask=(Array.isArray(data.ask)?data.ask:[]).filter(x=>ASK.includes(x)).slice(0,5);data.cq=String(data.cq||'').slice(0,120);if(!data.cq)delete data.cq}}
  if(col=='msgs'){const g=String(data.g||'');if(op!='add'||!await canMsg(me,g))return err('Forbidden',403);const i=randomUUID().slice(0,12);const t=String(data.t||'').slice(0,500),ts=Date.now();await s.setJSON(key('msgs',i,g),{g,u:me.id,t,ts});await s.setJSON('chatmeta/'+g,{u:me.id,t:t.slice(0,120),ts});return json({id:i})}
  const nid=op=='add'?randomUUID().slice(0,12):b.id;if(!/^[\w-]{1,100}$/.test(nid||''))return err('Bad id');const k=key(col,nid),old=await s.get(k,{type:'json'});
+ if(col=='friends'){const f=nid.slice(0,16),t=nid.slice(-16);if(nid.length!=33||nid[16]!='_'||f==t)return err('Bad id');
+  if(op=='delete'){if(!old)return json({ok:1});if(!(me.admin||old.f==me.id||old.t==me.id))return err('Forbidden',403);if(old.st=='rejected'&&old.f==me.id&&!me.admin)return err('Your request was declined',403);await s.delete(k);return json({ok:1})}
+  if(op=='update'){if(!old)return err('Not found',404);if(!(me.admin||old.t==me.id))return err('Only the person who received the request can decide',403);const o={...old};if(data.st=='accepted'||data.st=='rejected'){o.st=data.st;o.dt=Date.now()}if('hd' in data)o.hd=data.hd?1:0;if(o.st!='rejected')o.hd=0;await s.setJSON(k,o);return json({id:nid})}
+  if(f!=me.id)return err('Forbidden',403);if(!await s.get('profiles/'+t,{type:'json'}))return err('No such person',404);
+  if(old){if(old.st=='rejected')return err('Your request was declined',403);return json({id:nid})}
+  const back=await s.get('friends/'+t+'_'+f,{type:'json'});if(back){if(back.st=='accepted')return err('You are already friends');if(back.st=='pending')return err('They already sent you a request. Check Friends.')}
+  await s.setJSON(k,{f,t,st:'pending',ts:Date.now(),hd:0,_o:me.id});return json({id:nid})}
  if(op=='delete'){if(!old)return json({ok:1});if(!(me.admin||old._o==me.id))return err('Forbidden',403);if(col=='ideaReq'&&old.st=='rejected'&&!me.admin)return err('Your request was declined',403);await s.delete(k);if(col=='groups'||col=='ideas')await cascade(col,nid);return json({ok:1})}
  if(col=='ideaReq'){const uid=nid.slice(-16),parent=nid.slice(0,-17),ip=nid.length>17&&nid[nid.length-17]=='_'?await s.get('ideas/'+parent,{type:'json'}):null;if(!ip||ip.kind!='plan')return err('No such plan',404);
   if(op=='update'){if(!old)return err('Not found',404);if(!(me.admin||ip._o==me.id||ip.by==me.id))return err('Only the organiser can decide',403);const st2=data.st=='accepted'?'accepted':data.st=='rejected'?'rejected':null;if(!st2)return err('Bad decision');
    if(st2=='accepted'){const cur=(await s.list({prefix:'ideaIn/'+parent+'_'})).blobs;if(ip.need&&cur.length>=ip.need&&!cur.some(b=>b.key.endsWith('_'+uid)))return err('Team is full');await s.setJSON('ideaIn/'+parent+'_'+uid,{i:parent,u:uid,_o:uid});
-    {const gid='pg_'+parent,gk='groups/'+gid;let gr=await s.get(gk,{type:'json'});if(!gr){const opf=await s.get('profiles/'+ip.by,{type:'json'});gr={n:String(ip.t||'Team').slice(0,80),em:'🛠️',p:'Build',act:String(ip.roles||'Team project').slice(0,60),when:String(ip.wh||'Ongoing').slice(0,60),pl:'Team group',cap:Math.min(200,Math.max(2,Math.round(+ip.need)||2)),live:0,int:[],by:ip.by,ts:Date.now(),plan:parent,_o:ip.by};if(opf&&opf.loc)gr.loc=opf.loc;await s.setJSON(gk,gr);await s.setJSON('members/'+gid+'_'+ip.by,{g:gid,u:ip.by,_o:ip.by})}await s.setJSON('members/'+gid+'_'+uid,{g:gid,u:uid,_o:uid})}}
+    {const gid='pg_'+parent,gk='groups/'+gid;let gr=await s.get(gk,{type:'json'});if(!gr){const opf=await s.get('profiles/'+ip.by,{type:'json'});gr={n:await uniqTeam(ip.t,gid),em:'🛠️',p:'Build',act:String(ip.roles||'Team project').slice(0,60),when:String(ip.wh||'Ongoing').slice(0,60),pl:'Team group',cap:Math.min(200,Math.max(2,Math.round(+ip.need)||2)),live:0,int:[],by:ip.by,ts:Date.now(),plan:parent,_o:ip.by};if(opf&&opf.loc)gr.loc=opf.loc;await s.setJSON(gk,gr);await s.setJSON('members/'+gid+'_'+ip.by,{g:gid,u:ip.by,_o:ip.by})}await s.setJSON('members/'+gid+'_'+uid,{g:gid,u:uid,_o:uid})}}
    await s.setJSON(k,{...old,st:st2,dt:Date.now()});return json({id:nid})}
   if(nid.slice(-16)!=me.id||!nid.endsWith('_'+me.id))return err('Forbidden',403);if(ip.by==me.id)return err('You organise this plan');
   if(old&&old.st!='pending')return err(old.st=='accepted'?'Already accepted':'Your request was declined',403);
@@ -73,7 +84,11 @@ async function write(me,b){const{op,col}=b;if(![...COLS,'msgs'].includes(col))re
   if(UF.includes(col)){if(!nid.endsWith('_'+me.id))return err('Forbidden',403);data.u=me.id;const parent=nid.slice(0,-me.id.length-1);
    if(col=='members'){const gr=await s.get('groups/'+parent,{type:'json'});if(!gr)return err('No such group');if((gr.kk||[]).includes(me.id))return err('You were removed from this group by its admin',403);if(gr.plan)return err('This team group fills through its recruiting post',403);if((await s.list({prefix:'members/'+parent+'_'})).blobs.length>=gr.cap)return err('Group is full');data.g=parent}else{const ip=await s.get('ideas/'+parent,{type:'json'});if(!ip)return err('No such idea');if(ip.kind=='plan'&&ip.by!=me.id)return err('Send a join request first',403);if(ip.kind=='plan'&&ip.need&&(await s.list({prefix:'ideaIn/'+parent+'_'})).blobs.length>=ip.need)return err('Team is full');data.i=parent}}
   if(col=='meetups'&&!await s.get('members/'+data.g+'_'+me.id))return err('Join the group first',403)}
- if((col=='groups'||col=='lf')&&gloc&&!old)data.loc=gloc;await s.setJSON(k,op=='update'&&old?{...old,...data}:{...data,_o:old?old._o:me.id});return json({id:nid})}
+ if(col=='groups'&&!old)data.ts=Date.now();
+ if(col=='groups'&&(!old||'n' in data)){const nn=nname(data.n!=null?data.n:old&&old.n);if(!nn)return err('Give your group a name');const clash=(await rows('groups/')).find(g=>g.id!=nid&&nname(g.n)==nn);if(clash)return err('A group named “'+String(clash.n).slice(0,40)+'” already exists. Pick a different name.',409)}
+ if((col=='groups'||col=='lf')&&gloc&&!old)data.loc=gloc;await s.setJSON(k,op=='update'&&old?{...old,...data}:{...data,_o:old?old._o:me.id});
+ if(col=='groups'&&!old){const nn=nname(data.n),dup=(await rows('groups/')).filter(g=>g.id!=nid&&nname(g.n)==nn&&((g.ts||0)<data.ts||((g.ts||0)==data.ts&&g.id<nid)));if(dup.length){await s.delete(k);return err('A group with that name was just created. Pick a different name.',409)}}
+ return json({id:nid})}
 export default async req=>{try{const p=new URL(req.url).pathname.replace(/^\/api\/?/,''),b=req.method=='POST'?await req.json().catch(()=>({})):{};
  if(!SECRET)return err('Server not configured: set SESSION_SECRET',500);const s=st();
  if(p=='auth/request'){const e=String(b.email||'').trim().toLowerCase();if(!/^[^@\s]+@[a-z0-9.-]+$/.test(e)||!(e.endsWith('@'+DOM)||e.endsWith('.'+DOM)))return err('Use your @'+DOM+' email');
@@ -96,7 +111,7 @@ export default async req=>{try{const p=new URL(req.url).pathname.replace(/^\/api
  if(p=='gloc'){const id=String(b.id||'');if(!/^[\w-]{1,100}$/.test(id))return err('Bad id');const k='groups/'+id,o=await s.get(k,{type:'json'});if(!o)return err('No such group',404);if(!(o._o==me.id||o.by==me.id))return err('Forbidden',403);const la=+b.lat,ln=+b.lng;if(b.lat==null||b.lng==null||!(Math.abs(la)<=90&&Math.abs(ln)<=180))return err('Bad location');await s.setJSON(k,{...o,loc:enc({a:Math.round(la*1e5)/1e5,o:Math.round(ln*1e5)/1e5}),ac:Math.min(9999,Math.max(0,Math.round(+b.acc)||0))});return json({ok:1})}
  if(p=='kick'){const g=String(b.g||''),u=String(b.u||'');if(!/^[\w-]{1,100}$/.test(g)||!/^[\w-]{1,40}$/.test(u))return err('Bad request');const gk='groups/'+g,gr=await s.get(gk,{type:'json'});if(!gr)return err('No such group',404);if(!(me.admin||gr.by==me.id||gr._o==me.id))return err('Only the group admin can remove people',403);if(u==gr.by)return err('The group admin cannot be removed');await s.delete('members/'+g+'_'+u);gr.kk=[...new Set([...(gr.kk||[]),u])].slice(-50);await s.setJSON(gk,gr);if(gr.plan){await s.delete('ideaIn/'+gr.plan+'_'+u);const rk='ideaReq/'+gr.plan+'_'+u,ro=await s.get(rk,{type:'json'});if(ro)await s.setJSON(rk,{...ro,st:'rejected',dt:Date.now()})}return json({ok:1})}
  if(p=='ping'){const pk='profiles/'+me.id,old=await s.get(pk,{type:'json'});if(!old)return json({ok:1});await s.setJSON(pk,{...old,pg:Date.now()});return json({ok:1})}
- if(p=='sync'){await purgeSeed();const out={};for(const c of (b.cols||[]).filter(c=>COLS.includes(c)||c=='inbox'))out[c]=c=='reports'&&!me.admin?[]:c=='profiles'?await profilesFor(me):c=='groups'?await groupsFor(me):c=='lf'?await groupsFor(me,'lf'):c=='ideaReq'?await reqFor(me):c=='inbox'?await inboxFor(me):await rows(c+'/');return json(out)}
+ if(p=='sync'){await purgeSeed();const out={};for(const c of (b.cols||[]).filter(c=>COLS.includes(c)||c=='inbox'))out[c]=c=='reports'&&!me.admin?[]:c=='profiles'?await profilesFor(me):c=='groups'?await groupsFor(me):c=='lf'?await groupsFor(me,'lf'):c=='ideaReq'?await reqFor(me):c=='friends'?await frFor(me):c=='inbox'?await inboxFor(me):await rows(c+'/');return json(out)}
  if(p=='db'){if(b.op=='list'){const g=String(b.where?.g||'');if(b.col!='msgs'||!await canMsg(me,g))return err('Forbidden',403);return json({rows:(await rows('msgs/'+g+'/')).sort((a,c)=>a.ts-c.ts).slice(-100)})}return write(me,b)}
  return err('Not found',404)}catch(x){return err('Server error',500)}};
 export const config={path:'/api/*'};
