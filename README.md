@@ -27,3 +27,16 @@ netlify/functions/api.mjs    backend: email-code login, database, AI proxy (Netl
 ## Privacy notes
 - Coordinates are never sent to any client or admin; only a rounded distance for people/groups inside the relevant radius.
 - Stored location expires after 3 hours at most.
+
+## Version 2 changes
+- Login: stylish BudFin wordmark; page 1 asks name, alias and student email, then the email code; page 2 asks interests across every activity type (skippable, editable later).
+- Recruit: when a team gets its first accepted member, a group named exactly like the project is created automatically (organiser = group admin) and every accepted member is added. Team groups fill only through the recruiting post. Deleting the post deletes the group.
+- Search bars on Ideas and Recruit.
+- Presence: the app tells the server you are offline the moment it closes (pagehide beacon, 30 s after the tab is hidden, and a 2.5 min server timeout as a backup). "Free to chill?" is not switched off silently: you are asked when you leave and when you come back.
+- After switching "Free to chill?" on: "What's up today?" with Chill / Work / Learn / Something new, which opens a pre-filled group form.
+- Live location option (exact GPS with accuracy shown) wherever a place is asked: groups and Lost & Found. Live groups keep their pin updated while the creator is online. Coordinates stay encrypted; only a rounded distance is shown.
+- Group admin (creator, or app admin) can remove members; removed people cannot rejoin. New server routes: /api/kick, /api/gloc, /api/offline.
+- Full groups disappear from the main list and show only in search with a bold red "full".
+- Every choice list ends with "Write my own"; group size and team size accept any number from 2 to 200; radius sliders have a number box.
+- Profile button moved next to Settings; 64 emojis plus a custom emoji box for profile and groups.
+- UX: page, list and sheet animations, instant switch/button feedback, sticky form values across background refreshes, Esc closes sheets, chat Send button, scrollable sheets.
