@@ -8,50 +8,70 @@ const err=(m,s=400)=>json({error:m},s);
 const sha=s=>createHash('sha256').update(s).digest('hex'),sign=p=>createHmac('sha256',SECRET).update(p).digest('base64url'),uidOf=e=>sha('u:'+e).slice(0,16);
 const mint=email=>{const p=Buffer.from(JSON.stringify({e:email,x:Date.now()+30*864e5})).toString('base64url');return p+'.'+sign(p)};
 function who(req){const m=/(?:^|;\s*)bf=([^;]+)/.exec(req.headers.get('cookie')||'');if(!m||!SECRET)return null;const [p,s]=m[1].split('.');if(!p||!s)return null;const a=Buffer.from(sign(p)),b=Buffer.from(s);if(a.length!=b.length||!timingSafeEqual(a,b))return null;let o;try{o=JSON.parse(Buffer.from(p,'base64url'))}catch{return null}if(o.x<Date.now())return null;return{email:o.e,id:uidOf(o.e),admin:ADM.includes(o.e)}}
-const COLS=['profiles','groups','members','ideas','ideaIn','replies','lf','meetups','reports','config'],BYF=['groups','ideas','replies','lf','meetups','reports'],UF=['members','ideaIn'];
+const COLS=['profiles','groups','members','ideas','ideaIn','ideaReq','replies','lf','meetups','reports','config'],BYF=['groups','ideas','replies','lf','meetups','reports'],UF=['members','ideaIn'];
+const ASK=['resume','skills','avail','exp','why'],FRESH=15*6e4,PRES=10*6e4;
 const key=(c,id,g)=>c=='msgs'?`msgs/${g}/${id}`:`${c}/${id}`;
 async function rows(pre){const s=st(),{blobs}=await s.list({prefix:pre});const r=await Promise.all(blobs.slice(0,600).map(async b=>{const d=await s.get(b.key,{type:'json'});return d&&{id:b.key.split('/').pop(),...d}}));return r.filter(Boolean)}
 // ---- location privacy: coordinates are stored only as AES-256-GCM ciphertext and never sent to any client ----
-const H3=108e5,clampR=v=>{v=+v;return Number.isFinite(v)&&v>0?Math.min(2000,Math.max(100,Math.round(v/50)*50)):500};
+const H3=108e5,clampR=v=>{v=+v;return Number.isFinite(v)&&v>0?Math.min(2000,Math.max(100,Math.round(v/50)*50)):500},clampG=v=>{v=+v;return Number.isFinite(v)&&v>0?Math.min(5000,Math.max(100,Math.round(v/50)*50)):500};
 const LKEY=()=>Buffer.from(hkdfSync('sha256',Buffer.from(E.LOCATION_KEY||SECRET),Buffer.alloc(0),'budfin-loc-v1',32));
 const enc=o=>{const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',LKEY(),iv),ct=Buffer.concat([c.update(JSON.stringify(o),'utf8'),c.final()]);return 'v1.'+Buffer.concat([iv,c.getAuthTag(),ct]).toString('base64url')};
 const dec=t=>{try{const b=Buffer.from(String(t).slice(3),'base64url'),d=createDecipheriv('aes-256-gcm',LKEY(),b.subarray(0,12));d.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([d.update(b.subarray(28)),d.final()]).toString('utf8'))}catch{return null}};
 const meters=(a,b)=>{const r=Math.PI/180,h=Math.sin((b.a-a.a)*r/2)**2+Math.cos(a.a*r)*Math.cos(b.a*r)*Math.sin((b.o-a.o)*r/2)**2;return 12742e3*Math.asin(Math.sqrt(h))};
 async function profilesFor(me){const s=st(),raw=await rows('profiles/'),now=Date.now();
  for(const p of raw){let ch=0;
-  if(p.lat!=null||p.lng!=null){if(typeof p.lat=='number'&&typeof p.lng=='number'&&!p.loc)p.loc=enc({a:Math.round(p.lat*1e4)/1e4,o:Math.round(p.lng*1e4)/1e4});delete p.lat;delete p.lng;ch=1}
+  if(p.lat!=null||p.lng!=null){if(typeof p.lat=='number'&&typeof p.lng=='number'&&!p.loc)p.loc=enc({a:Math.round(p.lat*1e5)/1e5,o:Math.round(p.lng*1e5)/1e5});delete p.lat;delete p.lng;ch=1}
   if(p.loc&&now-(p.seen||0)>H3){delete p.loc;p.ready=0;ch=1}
   if(ch){const{id,...doc}=p;await s.setJSON('profiles/'+id,doc)}}
  const mp=raw.find(p=>p.id==me.id),mine=mp&&mp.loc?dec(mp.loc):null,myR=clampR(mp&&mp.rad);
- return raw.map(p=>{const{loc,...o}=p;if(p.id==me.id){o.hasLoc=loc?1:0;return o}
-  if(mine&&p.ready&&loc){const q=dec(loc);if(q){const d=meters(mine,q);if(d<=Math.min(myR,clampR(p.rad)))o.d=Math.max(10,Math.round(d/10)*10)}}
+ return raw.map(p=>{const{loc,pg,...o}=p;
+  o.online=p.on!==0&&now-(pg||0)<PRES?1:0;
+  if(p.id==me.id){o.hasLoc=loc?1:0;return o}
+  delete o.blk;delete o.hid;delete o.acc;delete o.seen;delete o.on;delete o.grad;
+  if(mine&&p.ready&&p.on!==0&&loc&&now-(p.seen||0)<FRESH){const q=dec(loc);if(q){const d=meters(mine,q);if(d<=Math.min(myR,clampR(p.rad)))o.d=Math.round(d)}}
   return o})}
+async function groupsFor(me){const raw=await rows('groups/'),mp=await st().get('profiles/'+me.id,{type:'json'}),mine=mp&&mp.loc&&Date.now()-(mp.seen||0)<=H3?dec(mp.loc):null;
+ return raw.map(g=>{const{loc,...o}=g;if(mine&&loc){const q=dec(loc);if(q)o.d=Math.round(meters(mine,q))}return o})}
+async function reqFor(me){const all=await rows('ideaReq/');if(me.admin)return all;const mine=new Set((await rows('ideas/')).filter(i=>i.by==me.id).map(i=>i.id));return all.filter(r=>r.u==me.id||mine.has(r.i))}
+async function inboxFor(me){const s=st(),{blobs}=await s.list({prefix:'chatmeta/'}),mem=new Set((await s.list({prefix:'members/'})).blobs.filter(b=>b.key.endsWith('_'+me.id)).map(b=>b.key.slice(8,-me.id.length-1)));
+ const keys=blobs.map(b=>b.key).filter(k=>{const g=k.slice(9);return g.startsWith('dm_')?g.slice(3).split('_').includes(me.id):g.startsWith('g_')&&mem.has(g.slice(2))});
+ return(await Promise.all(keys.slice(0,200).map(async k=>{const d=await s.get(k,{type:'json'});return d&&{id:k.slice(9),...d}}))).filter(Boolean)}
+async function cascade(col,id){const s=st(),wipe=async pre=>{const{blobs}=await s.list({prefix:pre});await Promise.all(blobs.slice(0,500).map(b=>s.delete(b.key)))};
+ if(col=='groups'){await wipe('members/'+id+'_');await wipe('msgs/g_'+id+'/');await s.delete('chatmeta/g_'+id);for(const m of await rows('meetups/'))if(m.g==id)await s.delete('meetups/'+m.id)}
+ if(col=='ideas'){await wipe('ideaIn/'+id+'_');await wipe('ideaReq/'+id+'_');for(const r of await rows('replies/'))if(r.i==id)await s.delete('replies/'+r.id)}}
+async function purgeSeed(){const s=st();if(await s.get('meta/purged1'))return;
+ for(const c of ['groups','ideas','lf'])for(const r of await rows(c+'/'))if(r._o=='seed'||r.by=='seed'){await s.delete(c+'/'+r.id);await cascade(c,r.id)}
+ await s.set('meta/purged1','1')}
 // ---- login code email: Gmail SMTP (GMAIL_USER + GMAIL_APP_PASSWORD) or Resend ----
 async function sendMail(to,code){const subject='Your BudFin code: '+code,text='Your BudFin sign-in code is '+code+'. It expires in 10 minutes. If you did not request it, ignore this email.';
  if(E.GMAIL_USER&&E.GMAIL_APP_PASSWORD){const t=nodemailer.createTransport({host:'smtp.gmail.com',port:465,secure:true,auth:{user:E.GMAIL_USER,pass:E.GMAIL_APP_PASSWORD.replace(/\s+/g,'')}});await t.sendMail({from:'BudFin <'+E.GMAIL_USER+'>',to,subject,text});return 1}
  if(E.RESEND_API_KEY){const r=await fetch('https://api.resend.com/emails',{method:'POST',headers:{authorization:'Bearer '+E.RESEND_API_KEY,'content-type':'application/json'},body:JSON.stringify({from:E.MAIL_FROM,to:[to],subject,text})});if(!r.ok)throw new Error('Resend '+r.status+' '+(await r.text()).slice(0,200));return 1}
  return 0}
 async function canMsg(me,g){if(!/^[\w-]{1,200}$/.test(g))return false;if(g.startsWith('dm_'))return g.slice(3).split('_').includes(me.id);if(g.startsWith('g_'))return !!(await st().get('members/'+g.slice(2)+'_'+me.id));return false}
-async function seed(){const s=st();if(await s.get('meta/seeded'))return;const o={_o:'seed',by:'seed'},G=[['s1','Sunset Football','⚽','Gym','Friendly 5-a-side match','Today · 6:00 PM','Sports ground',10,1,['football','fitness']],['s2','Chai Point Gang','☕','Chill','Chai and chill break','Now','Canteen / Chai point',8,1,['chai','anime']],['s3','End-Sem Study Circle','📚','Study','Group revision: Physics','Today · 8:00 PM','Cautley Library',8,0,['physics','chess']],['s4','Campus Builders','🛠️','Build','Weekend hack session','Sat · 4:00 PM','Main Building',12,0,['web dev','startups']],['s5','Lo-fi Jam Room','🎸','Music','Open jam, bring any instrument','Tomorrow · 7:00 PM','Other',8,0,['guitar','lo-fi']],['s6','Foodies of IITR','🍜','Food','Try a new café near campus','Sun · 1:00 PM','Other',10,0,['chai','cooking']],['s7','Canal Walkers','🌿','Chill','Evening walk by the canal','Today · 6:30 PM','Ganga Canal bank',6,1,['photography','poetry']]];
- for(const [id,n,em,p,act,when,pl,cap,live,int] of G)await s.setJSON('groups/'+id,{...o,n,em,p,act,when,pl,cap,live,int,ts:Date.now()});
- await s.setJSON('ideas/i1',{...o,t:'Campus carpool app for Delhi trips',b:'Match students heading to Delhi or Dehradun on the same day and split the fare.',ts:Date.now()});
- await s.setJSON('lf/l1',{...o,k:'lost',cat:'Bottle',col:'Blue',sz:'Medium',br:'Milton',loc:'Cautley Library',d:'steel bottle with a dent near the cap',ts:Date.now()});
- await s.setJSON('lf/l2',{...o,k:'found',cat:'ID card',col:'White',sz:'Small',br:'',loc:'Main Building',d:'IITR student ID card, name Ravi',ts:Date.now()});
- await s.set('meta/seeded','1')}
 async function write(me,b){const{op,col}=b;if(![...COLS,'msgs'].includes(col))return err('bad collection');const s=st();let data=b.data&&typeof b.data=='object'?{...b.data}:{};for(const k of Object.keys(data))if(k[0]=='_')delete data[k];if(JSON.stringify(data).length>4000)return err('Too large');
- if(col=='profiles'){for(const k of ['lat','lng','loc','seen','hasLoc','d'])delete data[k];if('rad' in data)data.rad=clampR(data.rad);if('ready' in data)data.ready=data.ready?1:0}
- if(col=='ideas'){if(data.kind!=='plan')delete data.kind;if(data.kind=='plan')data.need=Math.min(50,Math.max(2,Math.round(+data.need)||2))}
- if(col=='msgs'){const g=String(data.g||'');if(op!='add'||!await canMsg(me,g))return err('Forbidden',403);const i=randomUUID().slice(0,12);await s.setJSON(key('msgs',i,g),{g,u:me.id,t:String(data.t||'').slice(0,500),ts:Date.now()});return json({id:i})}
+ if(col=='profiles'){for(const k of ['lat','lng','loc','seen','hasLoc','d'])delete data[k];if('rad' in data)data.rad=clampR(data.rad);if('grad' in data)data.grad=clampG(data.grad);if('ready' in data)data.ready=data.ready?1:0;if('on' in data){data.on=data.on?1:0;if(!data.on)data.ready=0}for(const k of ['blk','hid'])if(k in data)data[k]=(Array.isArray(data[k])?data[k]:[]).filter(x=>typeof x=='string'&&/^[\w-]{1,40}$/.test(x)).slice(0,60);delete data.pg;delete data.acc}
+ let gloc=null;if(col=='groups'){const la=+data.lat,ln=+data.lng;if(data.lat!=null&&data.lng!=null&&Math.abs(la)<=90&&Math.abs(ln)<=180)gloc=enc({a:Math.round(la*1e5)/1e5,o:Math.round(ln*1e5)/1e5});for(const k of ['lat','lng','loc','d'])delete data[k]}
+ if(col=='ideas'){if(data.kind!=='plan'){delete data.kind;delete data.ask;delete data.cq}else{data.need=Math.min(50,Math.max(2,Math.round(+data.need)||2));data.ask=(Array.isArray(data.ask)?data.ask:[]).filter(x=>ASK.includes(x)).slice(0,5);data.cq=String(data.cq||'').slice(0,120);if(!data.cq)delete data.cq}}
+ if(col=='msgs'){const g=String(data.g||'');if(op!='add'||!await canMsg(me,g))return err('Forbidden',403);const i=randomUUID().slice(0,12);const t=String(data.t||'').slice(0,500),ts=Date.now();await s.setJSON(key('msgs',i,g),{g,u:me.id,t,ts});await s.setJSON('chatmeta/'+g,{u:me.id,t:t.slice(0,120),ts});return json({id:i})}
  const nid=op=='add'?randomUUID().slice(0,12):b.id;if(!/^[\w-]{1,100}$/.test(nid||''))return err('Bad id');const k=key(col,nid),old=await s.get(k,{type:'json'});
- if(op=='delete'){if(!old)return json({ok:1});if(!(me.admin||old._o==me.id))return err('Forbidden',403);await s.delete(k);return json({ok:1})}
+ if(op=='delete'){if(!old)return json({ok:1});if(!(me.admin||old._o==me.id))return err('Forbidden',403);if(col=='ideaReq'&&old.st=='rejected'&&!me.admin)return err('Your request was declined',403);await s.delete(k);if(col=='groups'||col=='ideas')await cascade(col,nid);return json({ok:1})}
+ if(col=='ideaReq'){const uid=nid.slice(-16),parent=nid.slice(0,-17),ip=nid.length>17&&nid[nid.length-17]=='_'?await s.get('ideas/'+parent,{type:'json'}):null;if(!ip||ip.kind!='plan')return err('No such plan',404);
+  if(op=='update'){if(!old)return err('Not found',404);if(!(me.admin||ip._o==me.id||ip.by==me.id))return err('Only the organiser can decide',403);const st2=data.st=='accepted'?'accepted':data.st=='rejected'?'rejected':null;if(!st2)return err('Bad decision');
+   if(st2=='accepted'){const cur=(await s.list({prefix:'ideaIn/'+parent+'_'})).blobs;if(ip.need&&cur.length>=ip.need&&!cur.some(b=>b.key.endsWith('_'+uid)))return err('Team is full');await s.setJSON('ideaIn/'+parent+'_'+uid,{i:parent,u:uid,_o:uid})}
+   await s.setJSON(k,{...old,st:st2,dt:Date.now()});return json({id:nid})}
+  if(nid.slice(-16)!=me.id||!nid.endsWith('_'+me.id))return err('Forbidden',403);if(ip.by==me.id)return err('You organise this plan');
+  if(old&&old.st!='pending')return err(old.st=='accepted'?'Already accepted':'Your request was declined',403);
+  const a=data.ans&&typeof data.ans=='object'?data.ans:{},ans={};for(const f of [...(ip.ask||[]),...(ip.cq?['ca']:[])]){const v=String(a[f]||'').trim().slice(0,300);if(!v)return err('Please fill in every requested field');ans[f]=v}
+  if(!old&&(await s.list({prefix:'ideaIn/'+parent+'_'+me.id})).blobs.length)return err('You are already in this team');
+  await s.setJSON(k,{i:parent,u:me.id,ans,st:'pending',ts:Date.now(),_o:me.id});return json({id:nid})}
  if(col=='config'&&!me.admin)return err('Forbidden',403);if(col=='profiles'&&nid!=me.id)return err('Forbidden',403);
  if(old&&!(me.admin||old._o==me.id))return err('Forbidden',403);if(!old&&op=='update')return err('Not found',404);
- if(old){delete data.by;delete data.u;delete data.g;if(col=='ideas'){delete data.kind;delete data.need}}else{
+ if(old){delete data.by;delete data.u;delete data.g;if(col=='ideas'){delete data.kind;delete data.need;delete data.ask;delete data.cq}}else{
   if(BYF.includes(col))data.by=me.id;
   if(UF.includes(col)){if(!nid.endsWith('_'+me.id))return err('Forbidden',403);data.u=me.id;const parent=nid.slice(0,-me.id.length-1);
-   if(col=='members'){const gr=await s.get('groups/'+parent,{type:'json'});if(!gr)return err('No such group');if((await s.list({prefix:'members/'+parent+'_'})).blobs.length>=gr.cap)return err('Group is full');data.g=parent}else{const ip=await s.get('ideas/'+parent,{type:'json'});if(!ip)return err('No such idea');if(ip.kind=='plan'&&ip.need&&(await s.list({prefix:'ideaIn/'+parent+'_'})).blobs.length>=ip.need)return err('Team is full');data.i=parent}}
+   if(col=='members'){const gr=await s.get('groups/'+parent,{type:'json'});if(!gr)return err('No such group');if((await s.list({prefix:'members/'+parent+'_'})).blobs.length>=gr.cap)return err('Group is full');data.g=parent}else{const ip=await s.get('ideas/'+parent,{type:'json'});if(!ip)return err('No such idea');if(ip.kind=='plan'&&ip.by!=me.id)return err('Send a join request first',403);if(ip.kind=='plan'&&ip.need&&(await s.list({prefix:'ideaIn/'+parent+'_'})).blobs.length>=ip.need)return err('Team is full');data.i=parent}}
   if(col=='meetups'&&!await s.get('members/'+data.g+'_'+me.id))return err('Join the group first',403)}
- await s.setJSON(k,op=='update'&&old?{...old,...data}:{...data,_o:old?old._o:me.id});return json({id:nid})}
+ if(col=='groups'&&gloc&&!old)data.loc=gloc;await s.setJSON(k,op=='update'&&old?{...old,...data}:{...data,_o:old?old._o:me.id});return json({id:nid})}
 export default async req=>{try{const p=new URL(req.url).pathname.replace(/^\/api\/?/,''),b=req.method=='POST'?await req.json().catch(()=>({})):{};
  if(!SECRET)return err('Server not configured: set SESSION_SECRET',500);const s=st();
  if(p=='auth/request'){const e=String(b.email||'').trim().toLowerCase();if(!/^[^@\s]+@[a-z0-9.-]+$/.test(e)||!(e.endsWith('@'+DOM)||e.endsWith('.'+DOM)))return err('Use your @'+DOM+' email');
@@ -63,15 +83,15 @@ export default async req=>{try{const p=new URL(req.url).pathname.replace(/^\/api
  if(p=='auth/verify'){const e=String(b.email||'').trim().toLowerCase(),k='otp/'+uidOf(e),o=await s.get(k,{type:'json'});if(!o||o.x<Date.now()||o.n>=5)return err('Code expired. Request a new one.');
   if(sha(String(b.code||'')+SECRET+e)!=o.h){await s.setJSON(k,{...o,n:o.n+1});return err('Wrong code')}await s.delete(k);
   return json({ok:1},200,{'set-cookie':`bf=${mint(e)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`})}
+ if(p=='auth/logout'){const m=who(req);if(m){try{const pk='profiles/'+m.id,o=await s.get(pk,{type:'json'});if(o){const{loc,...r}=o;await s.setJSON(pk,{...r,ready:0,pg:0})}}catch{}}return json({ok:1},200,{'set-cookie':'bf=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'})}
  const me=who(req);if(!me)return err('Sign in required',401);
  if(p=='me')return json({id:me.id,email:me.email,admin:me.admin});
  if(p=='loc'){const pk='profiles/'+me.id,old=await s.get(pk,{type:'json'});if(!old)return err('Profile not ready yet',404);
   if(b.clear){const{loc,...r}=old;await s.setJSON(pk,{...r,ready:0});return json({ok:1})}
   const la=+b.lat,ln=+b.lng;if(!(Math.abs(la)<=90&&Math.abs(ln)<=180)||b.lat==null||b.lng==null)return err('Bad location');
-  await s.setJSON(pk,{...old,loc:enc({a:Math.round(la*1e4)/1e4,o:Math.round(ln*1e4)/1e4}),seen:Date.now()});return json({ok:1})}
- if(p=='sync'){await seed();const out={};for(const c of (b.cols||[]).filter(c=>COLS.includes(c)))out[c]=c=='reports'&&!me.admin?[]:c=='profiles'?await profilesFor(me):await rows(c+'/');return json(out)}
+  await s.setJSON(pk,{...old,loc:enc({a:Math.round(la*1e5)/1e5,o:Math.round(ln*1e5)/1e5}),acc:Math.min(9999,Math.max(0,Math.round(+b.acc)||0)),seen:Date.now(),pg:Date.now()});return json({ok:1})}
+ if(p=='ping'){const pk='profiles/'+me.id,old=await s.get(pk,{type:'json'});if(!old)return json({ok:1});await s.setJSON(pk,{...old,pg:Date.now()});return json({ok:1})}
+ if(p=='sync'){await purgeSeed();const out={};for(const c of (b.cols||[]).filter(c=>COLS.includes(c)||c=='inbox'))out[c]=c=='reports'&&!me.admin?[]:c=='profiles'?await profilesFor(me):c=='groups'?await groupsFor(me):c=='ideaReq'?await reqFor(me):c=='inbox'?await inboxFor(me):await rows(c+'/');return json(out)}
  if(p=='db'){if(b.op=='list'){const g=String(b.where?.g||'');if(b.col!='msgs'||!await canMsg(me,g))return err('Forbidden',403);return json({rows:(await rows('msgs/'+g+'/')).sort((a,c)=>a.ts-c.ts).slice(-100)})}return write(me,b)}
- if(p=='ai'){if(!E.ANTHROPIC_API_KEY)return err('AI not configured',501);const k='ai/'+me.id+'-'+Math.floor(Date.now()/36e5),n=+(await s.get(k)||0);if(n>=20)return err('Hourly AI limit reached',429);await s.set(k,String(n+1));
-  const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'x-api-key':E.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01','content-type':'application/json'},body:JSON.stringify({model:E.AI_MODEL||'claude-haiku-5-5',max_tokens:300,messages:[{role:'user',content:String(b.prompt||'').slice(0,2000)}]})});const j=await r.json();return json({text:(j.content||[]).map(x=>x.text||'').join('')})}
  return err('Not found',404)}catch(x){return err('Server error',500)}};
 export const config={path:'/api/*'};
